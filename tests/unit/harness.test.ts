@@ -1,4 +1,6 @@
 // Harness smoke test: proves the domain project runs pure TS with no RN runtime.
+import { describe, it, expect } from '@jest/globals';
+
 describe('domain test harness', () => {
   it('runs TypeScript in plain node', () => {
     const double = (n: number): number => n * 2;
