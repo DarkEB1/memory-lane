@@ -331,6 +331,7 @@ tzOffsetMinutes is an integer in [-720, 840]
 1 <= sessionMaxItems <= 64 ; 1 <= maxTrialsPerItemPerSession <= 7
 sessionMaxTrials === sessionMaxItems * maxTrialsPerItemPerSession
 1 <= driftMax <= 2 ; driftMinSessions >= 1 ; driftConsecutive >= 1
+vanishPerSession === 1        // NOT a free parameter: session.vanishUsed is a boolean (§9.3)
 counterMax >= 1 ; sessionHistoryMax >= 1 ; clockMaxGapMs >= 0
 every other numeric field is a non-negative integer
 ```
@@ -520,8 +521,10 @@ export interface Scheduler {
 
   /** Pure. The scheduling-state group of telemetry §7 for one presentation.
    *  `nowMonoMs` is scoped to state.activeSession.bootId and is required for
-   *  `withinIntervalDeviationMs`. Returns the CLOSER(null) shape of §17.3 when
-   *  `directive.kind === 'CLOSER' && directive.itemId === null`. */
+   *  `withinIntervalDeviationMs`. Call it BEFORE folding the TrialCompleted it
+   *  describes, so every item-derived field is the PRE-increment value (§17.3).
+   *  A CLOSER naming a real item returns the item-derived shape of §17.3; only
+   *  CLOSER{itemId: null} — and the two fallbacks of §17.3 — return all-null. */
   trialTelemetry(
     state: SchedulerState,
     directive: Extract<TrialDirective, { kind: 'TRIAL' } | { kind: 'CLOSER' }>,
@@ -556,7 +559,8 @@ export function gapBinds(x: number, clockMaxGapMs: number): boolean;
 /** §1.4. Pure. */
 export function localDayIndex(anchorMs: number, tzOffsetMinutes: number): number;
 
-/** §17.1. Pure. `xs` need NOT be pre-sorted; the function sorts a copy with numAsc. */
+/** §17.1. Pure. `xs` need NOT be pre-sorted; the function sorts a copy with numAsc.
+ *  TOTAL: `median([]) === 0`. Never throws, never returns NaN. */
 export function median(xs: readonly number[]): number;
 
 /** §12.2. Pure. */
@@ -587,7 +591,8 @@ export function cueTransition(input: {
   floor: CueLevel; openingCue: CueLevel; trialClass: TrialClass;
   grade0: Grade; cueRaisedThisSession: boolean;
 }): {
-  cueLevel: CueLevel;             // the item's new floor
+  cueLevel: CueLevel;             // the floor this rule WOULD write; equals `floor` when it writes none
+  writesCueLevel: boolean;        // true => reduce assigns item.cueLevel = cueLevel; false => it does NOT
   stableSessionsReset: boolean;   // true => item.stableSessions = 0
   vanishResolved: boolean;        // true => entry.vanishResolved = true
   cueRaisedThisSession: boolean;  // the new value of entry.cueRaisedThisSession
@@ -706,9 +711,9 @@ export type SchedulerEvent = EventEnvelope & (
 
 ### 5.1 Notes a blind agent must not have to infer
 
-1. **There is no `isProbe` field on any event and no probe item is ever added.** Probe items are configured (`config.probeItemIds`) and their trials produce **no scheduler event at all** — the runtime logs them straight to telemetry. Requirement 13 is satisfied by absence, not by filtering. A `TrialCompleted` naming an unknown `itemId` returns the state **unchanged** (§6.4 rule R5).
-2. **`DistressReported.source` has exactly two variants, both human.** There is no `'abandonment'` and no `'repeated_skip'` variant, and no code path in this module constructs a `DistressReported`. Abandonment is `SessionEnded{reason:'abandoned'}` and changes **no item state**. EU AI Act Art. 5(1)(f) compliance is a property of the type, checkable by reading `schema.ts`.
-3. **`ItemRetired.by` and `ItemReEnabled.by` have no `'algorithm'` variant, in the type.** Invariant I-6.
+1. **There is no `isProbe` field on any event and no probe item is ever added.** Probe items are configured (`config.probeItemIds`) and their trials produce **no scheduler event at all** — the runtime logs them straight to telemetry. Requirement 13 is satisfied by absence, not by filtering. A `TrialCompleted` naming an unknown `itemId` returns the state **unchanged** by **rule R6** (no roster entry can exist for it), *not* by R5 — R5 does not cover `TrialCompleted` (§6.4 note 1).
+2. **`DistressReported.source` has exactly two variants, both human.** There is no `'abandonment'` and no `'repeated_skip'` variant, and no code path in this module constructs a `DistressReported`. Abandonment is `SessionEnded{reason:'abandoned'}` and changes **no item state**. EU AI Act Art. 5(1)(f) compliance is a property of the type, and is **asserted at runtime** against `EVENT_VARIANTS['DistressReported.source']` in `src/contract/schema.ts`, whose complete literal is §21.2 (I-9 clause 2, WE-28).
+3. **`ItemRetired.by` and `ItemReEnabled.by` have no `'algorithm'` variant, in the type** — and both are asserted at runtime against `EVENT_VARIANTS` (§21.2, I-9 clause 3). Invariant I-6.
 4. **`openingCueLevel`, `floorCueLevel` and `trialClass` are FACTS recorded by the presenter, not derivations.** They are what the patient actually saw. `reduce` reads them and never recomputes them. If they disagree with `nextTrial`'s output for that state, the fold **trusts the payload** and the adapter emits `presentation_mismatch = true` in telemetry. This is what keeps the device projection and the server recomputation identical when they have folded the same events.
 5. **`attempts` is the complete rescue chain of one trial**, ordered by `attemptIndex` ascending starting at 0, `length >= 1`, `length <= 4`. Only `attempts[0]` drives any state transition. Later attempts are telemetry and the P1 audit.
 6. **`DistressReported.severity` is consumed by NOTHING in this module.** `'mild'`, `'moderate'` and `'severe'` are behaviourally identical: all three set `endRequested = 'distress_stop'`, absorb the subject item, and produce `GENTLE_ON_DISTRESS = 2`. It is carried for the research plane and the caregiver record only. A blind test-writer must **not** build a case that expects the three to differ, and a blind implementer must **not** branch on it. (Chosen deliberately: graduating the response would mean the module deciding that some distress is not distress.)
@@ -731,7 +736,9 @@ canonicalOrder(e) = [ e.anchorMs asc, e.deviceId asc (strAsc), e.seq asc ]
 
 > for every device `d`, `anchorMs` is non-decreasing in `seq` order — implemented as a running maximum over that device's stream.
 
-With that obligation met, `canonicalOrder` preserves per-device causal order exactly, and is a strict total order because `(deviceId, seq)` is unique. Without it, a session's `SessionEnded` can sort before its `SessionStarted`; rule R2 (§6.3) makes that non-corrupting but it is still wrong, and fixture `ordering/out-of-order-batches.json` asserts the boundary's behaviour.
+With that obligation met, `canonicalOrder` preserves per-device causal order exactly, and is a strict total order because `(deviceId, seq)` is unique.
+
+**The boundary is NOT a function of this module, and the fixture does not call one (was ambiguous, chosen).** §21.1 exports no sorter, no normaliser and no validator, and §6.2 states that `fold` "does not check it, does not sort, and does not throw". `ordering/out-of-order-batches.json` is therefore keyed to **`fold`**, and it asserts **what `fold` actually does with a log that violates the obligation** — i.e. it *documents the tolerated corruption*, in numbers. The reading in which it asserts the reordered log's state, via a boundary function this module does not export, is **rejected**: there is nothing to import. The fixture's third case supplies the *already-repaired* array as plain input data (the running maximum applied by the test author, not by any exported call) so that the two folded states can be diffed. All three cases are derived in WE-26.
 
 **Device-vs-server divergence, declared.** The device folds only the events it has produced. The server folds the union. They agree **iff they have folded the same set**. The product therefore ships a stated precondition: **one device per patient at a time.** If the ADR later returns other devices' events on `/sync` pull, the fold is already correct over the union — that is why `deviceId` is in the ordering key — but until it does, "two tablets merge deterministically" describes the *server's* state only, and the second tablet's local projection will be stale until it syncs and re-folds. This is a documented limitation, not a claim.
 
@@ -757,7 +764,7 @@ No test may assert reference identity for a non-R0 no-op, and no implementation 
 
 `seq` is strictly increasing per device and never reused (ADR §4.3), so R0 makes `reduce` exactly-once against duplicate local delivery, retried SQLite writes, and replayed batches. **Invariant I-2:** folding any canonical log twice, with every event duplicated in place, yields a state deeply equal to folding it once — the duplicate always lands on R0 precisely *because* R1 already advanced the high-water mark on the no-op.
 
-**Ingest-order violations are tolerated, not detected.** §6.1 places the per-device monotonicity obligation on the ingest boundary. `fold` does **not** check it, does not sort, and does not throw. A log that violates it is folded exactly as ordered; R2 converts the worst case into an `app_crash` close (§6.3). There is no validation function and no error channel — that is what "total" means.
+**Ingest-order violations are tolerated, not detected.** §6.1 places the per-device monotonicity obligation on the ingest boundary. `fold` does **not** check it, does not sort, and does not throw. A log that violates it is folded exactly as ordered. There is no validation function and no error channel — that is what "total" means. **Two failure shapes result, and the second is the serious one:** R2 converts an unclosed session into an `app_crash` close (§6.3), which keeps every trial's evidence and loses only the reason string; and **R0 silently drops any event whose `seq` has already been passed by an out-of-order sibling**, which can swallow an entire session without a trace. WE-26 derives both with numbers. Neither is detected here, which is exactly why §6.1 puts the running maximum on the boundary rather than pretending `fold` will catch it.
 
 ### 6.3 Crash and boot recovery — rule R2
 
@@ -788,7 +795,7 @@ This single rule closes three distinct holes:
 |---|---|---|
 | R3 | `SessionStarted` while a session with the **same** `sessionId` and `bootId` is open | state unchanged (R0 usually catches this first) |
 | R4 | any session-scoped event other than `SessionStarted` while `activeSession === null` | state unchanged |
-| R5 | an **`Item*` event** naming an `itemId` not in `state.items` | state unchanged (this is the probe path and the unknown-id path) |
+| R5 | one of the **five** events `ItemContentReadyChanged`, `ItemTierSet`, `ItemRecognitionBlockSet`, `ItemRetired`, `ItemReEnabled` naming an `itemId` not in `state.items` | state unchanged (this is the probe path and the unknown-id path). **`ItemAdded` is excluded — see note 1** |
 | R6 | `TrialCompleted` whose `itemId` has no roster entry in the open session | state unchanged |
 | R7 | `TrialCompleted` with `attempts.length === 0` | state unchanged |
 | R8 | `ItemAdded` for an `itemId` already in `state.items`, **or for an `itemId` present in `config.probeItemIds`** | state unchanged |
@@ -801,7 +808,7 @@ In every row, R1 still applies (§6.2): `seqHighWater` advances.
 
 **Five scope decisions that were previously ambiguous, now chosen:**
 
-1. **R5 covers `Item*` events ONLY** — `ItemAdded`, `ItemContentReadyChanged`, `ItemTierSet`, `ItemRecognitionBlockSet`, `ItemRetired`, `ItemReEnabled`. It does **not** cover `TrialCompleted` (which R6 and R11 handle) and it does **not** cover `DistressReported`. A `DistressReported` naming a probe id, a deleted id, or any unknown id **still ends the session** — see §15.1 step 3. Requirement 14 is not gated behind an id lookup.
+1. **R5 covers exactly FIVE event types** — `ItemContentReadyChanged`, `ItemTierSet`, `ItemRecognitionBlockSet`, `ItemRetired`, `ItemReEnabled`. **`ItemAdded` is NOT among them**, and the previous revision's list, which included it, was self-defeating: `ItemAdded`'s whole purpose is to name an `itemId` that is *not* yet in `state.items`, so reading R5 literally made **every** `ItemAdded` a no-op and no item could ever exist. `ItemAdded` is governed by R8 alone (it is a no-op iff the id is *already* present, or is in `config.probeItemIds`). R5 does **not** cover `TrialCompleted` (R6 and R11 handle it) and does **not** cover `DistressReported`: a `DistressReported` naming a probe id, a deleted id, or any unknown id **still ends the session** — see §15.1 step 3. Requirement 14 is not gated behind an id lookup.
 2. **R10 no longer covers `ItemReEnabled`.** `ItemReEnabled` applies its full §6.5 reset **every time**, including to an item that is already `status === 'active'`. Its writes are a deliberate ladder reset, not an idempotent status assignment, and the previous "may be returned unchanged" made two blind agents produce different trajectories from the same log. There is exactly one behaviour: reset.
 3. **R11 is new and makes the §15.1 precedence table real.** A `TrialCompleted` naming a `retired` or `absorbing_distress` item is a total no-op even though the item is in `state.items` and has a roster entry — rank 1 and rank 2 say "invisible to every function", and without R11 the §8.3 "always" block would have moved `repetitionNumber`, `cueLevel`, `trials` and `trialsCompleted` on a set-aside item. Unreachable via `nextTrial` (which filters on `status === 'active'`); fully reachable in a generated log and in a distress-then-trial ordering.
 4. **R8 also blocks probe-id collisions.** Requirement 13's "satisfied by absence" now has an enforcement point: an `ItemAdded` naming an id in `config.probeItemIds` is dropped, so a probe can never become schedulable. `config.probeItemIds` and `state.items` are disjoint by construction, for every reachable state.
@@ -1015,6 +1022,8 @@ entry.trialsThisSession === 0
 
 Then `openingCueLevel = item.cueLevel - 1`, and at trial close `entry.vanishAttempted = true`, `session.vanishUsed = true`.
 
+**`config.vanishPerSession` is READ BY NO RULE — pinned (was ambiguous).** `session.vanishUsed` is a **boolean**, so the deck-wide cap it implements is exactly 1 and no other value is representable. The rule above is literally `!session.vanishUsed`; it does not compare a counter against `config.vanishPerSession`. The field remains in `SchedulerConfig` for provenance and for the `config.json` fixture's 49-field deep equality, and §2.3 pins `vanishPerSession === 1` as a **precondition** — behaviour under any other value is undefined and untested, exactly like a malformed ladder. This is the one place where "there are no numbers in function bodies" (§2) is satisfied by the state model's shape rather than by a config read, and it is stated rather than left for two blind agents to guess at.
+
 **The deck-wide cap is load-bearing and is the single most important repair in this document.** Without it, the design's own proven fixed point — every item at `cueLevel 3`, `acrossRung 0` — produces this: two exposure sessions raise `stableSessions` to 2 on *all eight items simultaneously*; the next session opens all eight at cue 2, a real two-alternative question the person cannot do; roughly half are misses on family photographs and the other half are correct **by coin flip** and promote the floor, which then fails next session and cycles. The confrontation rate would grow with the number of degraded items — that is, **it would accelerate with decline**. With the cap it is at most one vanish attempt per session regardless of deck size or degradation, and a failed one costs `stableSessions`, so the next attempt on that item is two qualifying sessions away.
 
 **Which item gets the slot is deterministic**: the first vanish-eligible item that `nextTrial` presents in that session. `nextTrial` is single-valued, so this is single-valued.
@@ -1027,10 +1036,36 @@ With `c0 = openingCueLevel`, `f = floorCueLevel` (both from the event payload), 
 |---|---|---|
 | **Floor/supported miss** | `trialClass ∈ {FLOOR, SUPPORTED}` and `g0 === 'MISS'` and `!entry.cueRaisedThisSession` | `item.cueLevel = min(f + 1, 3)`; `item.stableSessions = 0`; `entry.cueRaisedThisSession = true` |
 | **Repeat miss, same session** | as above but `entry.cueRaisedThisSession === true` | `item.stableSessions = 0` only. **No further cue rise.** |
-| **Vanish success** | `trialClass === 'VANISH'` and `g0 === 'CLEAN'` | `item.cueLevel = f - 1`; `item.stableSessions = 0`; `entry.vanishResolved = true` |
-| **Vanish slow** | `trialClass === 'VANISH'` and `g0 === 'SLOW'` | `item.cueLevel` **unchanged**; `item.stableSessions = 0`; `entry.vanishResolved = true` |
-| **Vanish failure** | `trialClass === 'VANISH'` and `g0 === 'MISS'` | `item.cueLevel` **unchanged**; `item.stableSessions = 0`; `entry.vanishResolved = true` |
-| Otherwise | — | no cue change |
+| **Vanish success** | `trialClass === 'VANISH'` and `g0 === 'CLEAN'` | `item.cueLevel = max(f - 1, 0)`; `item.stableSessions = 0`; `entry.vanishResolved = true` |
+| **Vanish resolved otherwise** | `trialClass === 'VANISH'` and `g0 ∈ {SLOW, MISS, EXPOSURE}` | `item.cueLevel` **not written**; `item.stableSessions = 0`; `entry.vanishResolved = true` |
+| Otherwise | — | **nothing at all** — `item.cueLevel` is not written, `item.stableSessions` is not written |
+
+**"No cue change" means `item.cueLevel` IS NOT WRITTEN — pinned, and this is why `writesCueLevel` exists (was ambiguous, chosen).** `cueTransition` is TOTAL and must return a `cueLevel` on all 384 rows, but the only floor value it holds is `f = event.floorCueLevel`, and it is forbidden to read `item.cueLevel` (authority table below). Returning `f` on a "no cue change" row and letting `reduce` assign it unconditionally would let a payload whose `floorCueLevel` disagrees with the stored floor **silently rewrite the floor on a CLEAN trial** — item at floor 0, payload `floorCueLevel: 3`, grade `CLEAN`, class `FLOOR` would move the stored floor 0 → 3. That reading is **rejected**. The chosen rule is mechanical, not prose:
+
+```
+reduce, on a non-VOID, non-closer TrialCompleted:
+    r = cueTransition({ floor: event.floorCueLevel, openingCue: event.openingCueLevel,
+                        trialClass: event.trialClass, grade0: g0,
+                        cueRaisedThisSession: entry.cueRaisedThisSession })
+    if (r.writesCueLevel)       item.cueLevel       = r.cueLevel     // and ONLY then
+    if (r.stableSessionsReset)  item.stableSessions = 0
+    if (r.vanishResolved)       entry.vanishResolved = true
+    entry.cueRaisedThisSession = r.cueRaisedThisSession              // unconditional; idempotent
+```
+
+**`cueTransition`, complete and total — all 384 rows fall in exactly one of these five arms.** `openingCue` is an input of the signature and is **read by no arm**; it is carried only so that `cue-transitions.json` can compute the `unreachable` label of §23. Two rows differing only in `openingCue` have identical results.
+
+| # | arm (checked in this order) | `cueLevel` | `writesCueLevel` | `stableSessionsReset` | `vanishResolved` | `cueRaisedThisSession'` | rows |
+|---|---|---|---|---|---|---|---|
+| 1 | `trialClass === 'VANISH'` and `grade0 === 'CLEAN'` | `max(f − 1, 0)` | **true** | true | true | `cr` (unchanged) | 32 |
+| 2 | `trialClass === 'VANISH'` and `grade0 ∈ {SLOW, MISS, EXPOSURE}` | `f` | false | true | true | `cr` (unchanged) | 96 |
+| 3 | `trialClass ∈ {FLOOR, SUPPORTED}` and `grade0 === 'MISS'` and `cr === false` | `min(f + 1, 3)` | **true** | true | false | **true** | 32 |
+| 4 | `trialClass ∈ {FLOOR, SUPPORTED}` and `grade0 === 'MISS'` and `cr === true` | `f` | false | true | false | true | 32 |
+| 5 | otherwise (`trialClass ∈ {FLOOR, SUPPORTED}`, `grade0 ∈ {SLOW, CLEAN, EXPOSURE}`) | `f` | false | **false** | false | `cr` (unchanged) | 192 |
+
+`32 + 96 + 32 + 32 + 192 = 384`, so the arms partition `cue-transitions.json` exactly and the test-writer can check the partition before checking a single value.
+
+Arm 1's `max(f − 1, 0)` is stated because `f === 0` is an `unreachable: true` row that the function must still answer for; `f − 1 = −1` is not a `CueLevel`. Arm 2 covers `VANISH` + `EXPOSURE`, which §18.1's three-row table did not list: a vanish attempt that arrives graded `EXPOSURE` still **resolves** the vanish and still costs the streak, exactly like `SLOW` and `MISS`. Arm 5 is the 192-row "no cue change" block, and it writes **nothing**: `stableSessions` is left alone as well as `cueLevel`, so a `CLEAN` trial at floor cannot touch either, and the item's own floor survives a disagreeing payload untouched (WE-27). `stableSessions` still moves for those items — at S3, through `outcomeFor` and §13.2, which is the only other site.
 
 **Which payload field is authoritative where — pinned (was ambiguous).** `attempts[0].cueLevel`, `event.openingCueLevel`, `event.floorCueLevel` and `event.trialClass` are four independent trusted facts (§5.1 note 4). They can disagree. `reduce` **never reconciles them** and never recomputes any of them; each rule reads exactly the one named here and no other:
 
@@ -1591,10 +1626,11 @@ Inside the block each probe trial opens at **cue level 0**, one uncued attempt; 
 This is the **only** output of this module that reaches a human, and it gates a treatable medical emergency. It is therefore built out of quantities the engine's own compensation cannot suppress.
 
 ```
-median(xs)  // xs: integers, sorted ascending with numAsc
+median(xs)  // xs: integers; the function sorts a COPY ascending with numAsc, mutating nothing
   n = xs.length
-  n odd  -> xs[(n-1)/2]
-  n even -> Math.floor((xs[n/2 - 1] + xs[n/2]) / 2)
+  n === 0 -> 0                                       // TOTAL; pinned, was undefined
+  n odd   -> xs[(n-1)/2]
+  n even  -> Math.floor((xs[n/2 - 1] + xs[n/2]) / 2)
 
 acuteChange(state, nowAnchorMs):
   if (!config.acuteSignalEnabled) return null
@@ -1689,7 +1725,63 @@ interface TrialSchedulingTelemetry {
 
 Also pinned: `acrossIntervalDeviationMs` is **not** gap-clamped either (it is explicitly signed, and clamping it would destroy the sign it exists to carry); `daysSinceLastReview` and `daysSinceFirstIntroduction` **are** gap-clamped, and — per §1.3 — none of the three moves `clockAnomalyCount`, because `trialTelemetry` is pure.
 
-**`CLOSER{itemId: null}` — the exact return (E17).** The generic P11 closer names no item, so every item-derived field is `null` and the presentation fields describe the generic card:
+**`trialTelemetry` — the complete decision procedure, all four branches (was ambiguous, chosen).** Every session in §19 ends with a closer naming a real item, so the ordinary case is branch 3 and it must be pinned to the field.
+
+```
+trialTelemetry(state, directive, nowAnchorMs, nowMonoMs):
+  s = state.activeSession
+  id = directive.kind === 'TRIAL' ? directive.itemId : directive.itemId   // null only for CLOSER
+
+  BRANCH 1 — s === null                          -> the ALL-NULL shape below, presentation fields per (P)
+  BRANCH 2 — id === null                         -> the ALL-NULL shape below, presentation fields per (P)
+  BRANCH 3 — id is a key of state.items          -> the ITEM-DERIVED shape below
+  BRANCH 4 — id is NOT a key of state.items      -> the ALL-NULL shape below, presentation fields per (P)
+
+  (P) the presentation fields, identical in all four branches:
+        directive.kind === 'CLOSER':
+            openingCueLevel = 3            // §10.2: closers are cue 3, unconditionally
+            floorCueLevel   = BRANCH 3 ? item.cueLevel : 3
+            wasVanishAttempt = false ; isCloser = true
+        directive.kind === 'TRIAL':
+            openingCueLevel = directive.openingCueLevel
+            floorCueLevel   = directive.floorCueLevel
+            wasVanishAttempt = directive.trialClass === 'VANISH' ; isCloser = false
+        presentationMode = f(openingCueLevel)          // 0 free_recall, 1 cued_recall,
+                                                       // 2 recognition, 3 familiarity_exposure
+        nDistractors     = openingCueLevel === 2 ? 1 : 0
+        driftAdjustmentApplied   = s === null ? 0     : s.driftAtStart
+        difficultyFloorTriggered = s === null ? false : s.gentleActive
+```
+
+**BRANCH 3 — the ITEM-DERIVED shape.** `item = state.items[id]`; `entry` = the roster entry of `s.roster` whose `itemId === id`, or `undefined` if it has none (an item added mid-session, or a closer chosen from a roster the directive did not come from):
+
+```
+itemId                    = id
+itemTier                  = item.tier
+repetitionNumber          = item.repetitionNumber            // PRE-increment; see note 4
+daysSinceLastReview       = item.lastSeenAtMs === null ? null
+                            : Math.floor(clampGap(nowAnchorMs - item.lastSeenAtMs) / 86400000)
+daysSinceFirstIntroduction= Math.floor(clampGap(nowAnchorMs - item.addedAtMs) / 86400000)
+D                         = s === null ? state.participant.driftLevel : s.driftAtStart
+scheduledIntervalMs       = ACROSS_LADDER_MS[ effectiveAcrossRung(item, D, config) ]
+acrossIntervalDeviationMs = item.lastSeenAtMs === null ? null
+                            : (nowAnchorMs - item.lastSeenAtMs) - scheduledIntervalMs   // NOT clamped
+withinSessionRung         = entry === undefined ? null : entry.withinRung
+withinIntervalDeviationMs = (entry === undefined || entry.lastTerminalMonoMs === null) ? null
+                            : nowMonoMs - entry.nextEligibleMonoMs                       // NOT clamped
+attainedRung              = item.acrossRung
+overdueReturnApplied      = entry === undefined ? false : entry.overdueReturn
+stability = difficulty = retrievability = predictedRecallProbability = null
+```
+
+Four notes, each closing a reading a blind agent would otherwise have to guess:
+
+1. **A closer naming a real item is BRANCH 3, not branch 2.** The reading in which a closer returns the all-null shape "because it drives no ladder state" is **rejected**. The closer is a real presentation of a real item; §7's field dictionary asks what was shown, and §10.2's exhaustive delta governs what `reduce` *writes*, which is a different question. `it_0311`'s closer in session A therefore reports `itemTier: 2`, `attainedRung: 4`, `scheduledIntervalMs: 604800000` and so on — see WE-25.
+2. **`floorCueLevel` on a closer is `item.cueLevel`, not 3.** The closer opens at cue 3 because §10.2 says so; the item's floor is whatever it is. In WE-25 the pair is `openingCueLevel: 3, floorCueLevel: 2` — a `SUPPORTED`-class presentation, which is exactly what §19.0.1's closer payload records.
+3. **`withinIntervalDeviationMs` on a closer is the ordinary formula, not `null`.** A closer never updates `nextEligibleMonoMs` (§10.2), so the value is measured against the entry's *stale* eligibility — which is the honest reading of "actual minus intended", and is typically negative because the closer is presented before the item's next within-ladder slot. It is `null` only when the item has no roster entry, or has one it has never been presented from (`lastTerminalMonoMs === null`).
+4. **`repetitionNumber` is PRE-increment, on every branch.** `trialTelemetry` reports the state as it stands at call time; `reduce` increments `repetitionNumber` when it folds the `TrialCompleted` that follows. WE-24 already pins this (`it_0042` reports **32** after two folded trials, while about to be presented for its third), and WE-25 pins it for a closer.
+
+**BRANCH 1 / 2 / 4 — the ALL-NULL shape.** Every item-derived and entry-derived field is `null`; only the (P) fields carry values. For `CLOSER{itemId: null}` (the generic P11 closer, E17) with a session open:
 
 ```
 { itemId: null, itemTier: null, repetitionNumber: 0,
@@ -1704,7 +1796,7 @@ Also pinned: `acrossIntervalDeviationMs` is **not** gap-clamped either (it is ex
   stability: null, difficulty: null, retrievability: null, predictedRecallProbability: null }
 ```
 
-`trialTelemetry` **never throws**: with `state.activeSession === null`, or with a `TRIAL` directive naming an id not in `state.items`, it returns this same all-null shape with `openingCueLevel` / `floorCueLevel` / `isCloser` copied from the directive.
+`trialTelemetry` **never throws.** With `state.activeSession === null` (branch 1) or with a directive naming an id not in `state.items` (branch 4) it returns this same all-null shape, with the (P) fields recomputed for that directive: a `TRIAL` gets `openingCueLevel` / `floorCueLevel` from the directive, `wasVanishAttempt = directive.trialClass === 'VANISH'` and `isCloser: false`; a `CLOSER` gets `openingCueLevel: 3, floorCueLevel: 3, wasVanishAttempt: false, isCloser: true` — **3, not the item's floor, because in branches 1, 2 and 4 there is no item to read a floor from.** The old wording ("copied from the directive") was unusable for a `CLOSER`, whose `TrialDirective` arm carries neither `openingCueLevel`, nor `floorCueLevel`, nor `isCloser`; those three are supplied by the (P) rule, not copied.
 
 **`scheduledIntervalMs` is always integer milliseconds.** There is no `scheduled_interval_days` field emitted by this module — a field whose type changes with its value cannot be asserted by a blind test. The two deviation fields have **distinct names** for the within-session and across-session quantities; they were conflated in the source design.
 
@@ -1853,14 +1945,15 @@ The 72 rows above all have `trialClass = FLOOR`. The two other classes differ on
 
 | trialClass | how it arises | `g0` | `cueLevel'` | `stableSessions'` | contributes to outcome? |
 |---|---|---|---|---|---|
-| `FLOOR` | `c === f` | MISS | `min(f+1,3)` (once/session) | 0 | yes |
-| `FLOOR` | | SLOW/CLEAN/EXPOSURE | `f` | via outcome | yes |
-| `SUPPORTED` | `gentleActive` ∨ `overdueReturn` ∨ `driftAtStart > 0` ∨ `recognitionBlocked` with `f < 3` | MISS | `min(f+1,3)` (once/session) | 0 | yes — forces `SUPPORTED_SESSION` unless a MISS or SLOW outranks it |
-| `SUPPORTED` | | SLOW/CLEAN/EXPOSURE | `f` | 0 (via `SUPPORTED_SESSION`) | yes |
-| `VANISH` | `canVanish` (§9.3) | CLEAN | `f − 1` | 0, `vanishResolved = true` | **no** |
-| `VANISH` | | SLOW | `f` | 0, `vanishResolved = true` | **no** |
-| `VANISH` | | MISS | `f` (**unchanged**) | 0, `vanishResolved = true` | **no** |
-| any | attempt 0 is `isVoid` | — | `f` | unchanged | **no** — the trial is VOID (§7.3) |
+| `FLOOR` | `c === f` | MISS | `min(f+1,3)` **written** (once/session) | 0 | yes |
+| `FLOOR` | | SLOW/CLEAN/EXPOSURE | **not written** (arm 5) | not written at trial close; moves only via the outcome at S3 | yes |
+| `SUPPORTED` | `gentleActive` ∨ `overdueReturn` ∨ `driftAtStart > 0` ∨ `recognitionBlocked` with `f < 3` | MISS | `min(f+1,3)` **written** (once/session) | 0 | yes — forces `SUPPORTED_SESSION` unless a MISS or SLOW outranks it |
+| `SUPPORTED` | | SLOW/CLEAN/EXPOSURE | **not written** (arm 5) | not written at trial close; 0 at S3 via `SUPPORTED_SESSION` | yes |
+| `VANISH` | `canVanish` (§9.3) | CLEAN | `max(f − 1, 0)` **written** | 0, `vanishResolved = true` | **no** |
+| `VANISH` | | SLOW | **not written** | 0, `vanishResolved = true` | **no** |
+| `VANISH` | | MISS | **not written** — we made it harder, not them | 0, `vanishResolved = true` | **no** |
+| `VANISH` | | EXPOSURE (payload-only; arm 2) | **not written** | 0, `vanishResolved = true` | **no** |
+| any | attempt 0 is `isVoid` | — | **not written**; `cueTransition` is not called at all | unchanged | **no** — the trial is VOID (§7.3) |
 
 ---
 
@@ -1934,9 +2027,13 @@ Sessions A–D below are given as **per-item trial tables**. The `sessions/*.jso
 SessionStarted
 then, in ITEM-MAJOR order (items ascending by itemId, each item's trials in listed order):
     one TrialCompleted per listed trial
+then N contiguous GenericFillerShown{sessionId}, where N is the filler count the session
+    states (N = 0 in sessions A, B and C; N = 5 in session D — derived in WE-5)
 then the closer TrialCompleted (isCloser: true), if the table says a closer was presented
 then SessionEnded
 ```
+
+**Where the fillers go, and why anywhere is fine (was missing entirely).** The rule above had no slot for `GenericFillerShown`, which made session D's log unconstructible. Fillers are emitted **contiguously, after the last non-closer `TrialCompleted` and before the closer**. Placement is immaterial to the folded result: §10.1 gives `GenericFillerShown` exactly two effects, `session.fillersShown += 1` and `session.lastPresentedItemId = null`, and **both fields are ephemeral and discarded at S11**. The filler count therefore reaches `sessions/*.json` only through `seqHighWater`, and reaches `sessionTelemetry` through `nFillersShown` — which is why the count must still be derived correctly rather than transcribed.
 
 Envelopes: `deviceId: 'd1'`, `bootId` as stated per session, `seq` starting at 101 and incrementing by 1 across the whole chain (so `S0.seqHighWater.d1 = 100` and the final `seqHighWater.d1 = 100 + total events`), `eventId` = `'e_' + seq` zero-padded to 4 digits, `anchorMs` = the event's own terminal/started/ended anchor as stated.
 
@@ -1963,7 +2060,7 @@ Every non-closer attempt is `{correct, cueLevel: <openingCueLevel>, latencyMs: 4
 
 **WE-2 (session A) → WE-3 (session B) → WE-4 (session C) → WE-5 (session D) are CHAINED.** Each starts from the previous one's stated final state; `S0` feeds session A. Every number below has been re-derived under that chaining, including vanish eligibility, the drift window's actual size, and `it_0101`'s `stableSessions`. The previous revision's numbers were derived per-session in isolation and did not survive chaining; they are void.
 
-**WE-6, WE-7, WE-8, WE-9, WE-10, WE-11, WE-12, WE-13, WE-14, WE-15, WE-16 and WE-17…WE-24 are NOT chained.** Each states its own entering state and stands alone.
+**WE-6 through WE-29 are NOT chained.** Each states its own entering state and stands alone. (WE-25 is the sole partial exception: it reads a mid-session snapshot of WE-2's session A, but that snapshot is stated in full at the point of use and the example asserts a pure query, not a folded state.)
 
 **No vanish attempt occurs in sessions A, B, C or D.** This is engineered, not accidental, and the mechanism is stated so a blind test-writer can verify it rather than assume it:
 
@@ -2231,7 +2328,28 @@ dueAtMs        = 1801302544000 + 345600000 = 1801648144000
 | `it_0402` | 1 | `min(1+1,3) = 2` | `SUPPORTED` | `CLEAN × 7` (foil `it_0311`) | 7 |
 | `it_0555` | 2 | 3 | `SUPPORTED` | `EXPOSURE` | 1 |
 
-`it_0402` is the only item still in rotation after the first pass (the other five have `openingCueLevel === 3` → `withinDone` at trial close). Between its 6th and 7th trials it is the sole candidate **and** the last presented, so `nextTrial` returns `FILLER`: one `GenericFillerShown{sessionId:'S_D'}` is in the log, `fillersShown` ends at **1**, and `lastPresentedItemId` is nulled so trial 7 can be issued. After trial 7 (`withinRung` 6 → `withinDone`) every candidate is exhausted → `roster_exhausted`.
+`it_0402` is the only item still in rotation after the first pass (the other five have `openingCueLevel === 3` → `withinDone` at trial close). **The filler count is FIVE, and it is derived from §10, not asserted** (a previous revision said "one", which no §10-conformant picker produces). Here is the whole picker trace; `next-trial.json`'s `FILLER` cases transcribe it verbatim.
+
+At session start all six entries have `nextEligibleMonoMs = 0` and `withinRung = clamp(0 − 0, 0, 6) = 0`, so §10 step 6's key `[nextEligibleMonoMs, withinRung, tier, itemId]` reduces to `[tier, itemId]`:
+
+| call | candidates | step 4 | chosen | after |
+|---|---|---|---|---|
+| 1 | all 6 | ≥2, `lastPresented` null | `it_0042` (tier 1, least id) | `withinDone` |
+| 2 | 5 | ≥2 | `it_0101` | `withinDone` |
+| 3 | 4 | ≥2 | `it_0203` | `withinDone` |
+| 4 | 3 | ≥2 | `it_0311` (tier 2 < tier 3) | `withinDone` |
+| 5 | `it_0402`, `it_0555` | ≥2 | **`it_0402`** (tier 2 < tier 3) — its trial 1 | `withinRung 0→1`, `lastPresented = it_0402` |
+| 6 | `it_0402`, `it_0555` | ≥2 → drop `it_0402` | `it_0555` | `withinDone`, `lastPresented = it_0555` |
+| 7 | `it_0402` only | length 1 but `it_0402 !== it_0555` → **no filler** | `it_0402` trial 2 | `lastPresented = it_0402` |
+| 8 | `it_0402` only | length 1 **and** equals `lastPresented`, `fillersShown 0 < 16` | **`FILLER` #1** | `fillersShown 1`, `lastPresented = null` |
+| 9 | `it_0402` only | `null` ≠ `it_0402` | `it_0402` trial 3 | |
+| 10, 12, 14, 16 | `it_0402` only | equals `lastPresented` | **`FILLER` #2, #3, #4, #5** | `fillersShown` 2, 3, 4, 5 |
+| 11, 13, 15, 17 | `it_0402` only | `null` ≠ `it_0402` | `it_0402` trials 4, 5, 6, 7 | |
+| 18 | — | `it_0402` trial 7 closed at `r === 6` → `withinDone`; **no candidates** | `roster_exhausted` → `CLOSER` | |
+
+**`it_0555` is what makes it five rather than six.** It sorts after `it_0402` (tier 3 vs tier 2) and so is presented *between* `it_0402`'s trials 1 and 2, which supplies the interleaving for that one gap for free. Only the five gaps between trials 2–3, 3–4, 4–5, 5–6 and 6–7 need a filler.
+
+So: **five** `GenericFillerShown{sessionId:'S_D'}` events are in the log, `session.fillersShown` ends at **5**, and `nFillersShown` is **5**. After trial 7 (`withinRung` 6 → `withinDone`) every candidate is exhausted → `roster_exhausted`. `fillersShown` is ephemeral, so the only trace of the five in the final state is `seqHighWater`.
 
 Closer: `15 mod 5 = 0` → **`it_0042`**, `terminalMonoMs 580000`.
 `SessionEnded{reason:'roster_exhausted', closerPresented:true, endedMonoMs:590000, anchorMs:1801649590000}`.
@@ -2264,7 +2382,20 @@ cueLevel       = 2   unchanged  (the transform never writes the floor)
 **Participant:** `sessionCount 16`, **`gentleSessionsRemaining = max(1 − 1, 0) = 0`** → the floor clears, `lastSessionEndedAtMs 1801649590000`, `history.length 14`.
 **Drift:** window opens at `1800439990000`; `W = [S_B, S_C, S_D]`, `|W| = 3 < 6` → unchanged at 0.
 
-**`sessionTelemetry(state, 'roster_exhausted', true)` for this session** (called before folding `SessionEnded`): `{sessionId:'S_D', endedOnSuccess:true, sessionEndReason:'roster_exhausted', plannedNItems:6, completedNItems:6, probeBlockEmitted:false, probeTruncated:false, nFillersShown:1, clockAnomalyCount:0}`.
+**`sessionTelemetry(state, 'roster_exhausted', true)` for this session** (called before folding `SessionEnded`): `{sessionId:'S_D', endedOnSuccess:true, sessionEndReason:'roster_exhausted', plannedNItems:6, completedNItems:6, probeBlockEmitted:false, probeTruncated:false, nFillersShown:5, clockAnomalyCount:0}`.
+
+#### The `seqHighWater` of the chain, pinned
+
+`sessions/*.json` compares by deep equality and `seqHighWater` is a top-level field, so the four chained files must agree on it exactly. `S0.seqHighWater = {d1: 100}` and `seq` runs unbroken from 101 (§19.0.1):
+
+| session | events | breakdown | `seq` range | final `seqHighWater.d1` |
+|---|---|---|---|---|
+| A (`S_A`) | 29 | 1 start + 26 trials (6+1+6+6+6+1) + 0 fillers + 1 closer + 1 end | 101–129 | **129** |
+| B (`S_B`) | 29 | 1 + 26 (6+1+6+6+6+1) + 0 + 1 + 1 | 130–158 | **158** |
+| C (`S_C`) | 30 | 1 + 27 (**7**+1+6+6+6+1) + 0 + 1 + 1 | 159–188 | **188** |
+| D (`S_D`) | 20 | 1 + 12 (1+1+1+1+**7**+1) + **5 fillers** + 1 + 1 | 189–208 | **208** |
+
+`eventId` is `'e_' + seq` zero-padded to 4 digits, so session D's last event is `e_0208`.
 
 ---
 
@@ -2486,7 +2617,7 @@ Without this rule one doorbell demotes the daughter's photograph a cue rung, con
 | The **same** skewed session is folded twice | the identical `SessionStarted`, replayed | R0 fires on the replay and returns the state **by reference**, so `clockAnomalyCount` stays at 1. The counter is idempotent under replay because it lives behind R0, like everything else. |
 | `planRoster(state, skewedAnchorMs)` called **directly** | any clamp-binding gap | Returns the roster. **`clockAnomalyCount` does not move** — only `reduce` counts (§1.3). Same for `signals`, `trialTelemetry`, `acuteChange` and `nextTrial`. |
 | Clock corrected **mid-session** | irrelevant | Within-session timing is `monoMs` scoped to `bootId` and is untouched by any wall-clock correction. The session budget, `nextEligibleMonoMs` and `latencyMs` cannot move. |
-| Batch skew reorders one device's own events | `anchorMs` non-monotone in `seq` | The **ingest boundary** must apply a running maximum (§6.1). If it does not, R2 closes the mis-ordered session as `app_crash` rather than corrupting it, and `ordering/out-of-order-batches.json` fails loudly. |
+| Batch skew reorders one device's own events | `anchorMs` non-monotone in `seq` | The **ingest boundary** must apply a running maximum (§6.1). If it does not, `fold` folds the log exactly as ordered — no check, no sort, no throw — and the damage is bounded to two shapes: R0 silently **drops** every event whose `seq` has already been passed (an entire session can vanish), and R2 closes a still-open session as `app_crash` instead of on its own reason. `ordering/out-of-order-batches.json` asserts those two folded states and, as a third case, the state the running-maximum-repaired array folds to. It does **not** "fail loudly" — nothing in this module fails at all, which is what "total" means. WE-26 gives all three with numbers. |
 
 ---
 
@@ -2661,6 +2792,274 @@ It returns; it does not throw.
 
 ---
 
+### WE-25 — `trialTelemetry` for a CLOSER that names a REAL item (§17.3 branch 3)
+
+**NOT chained.** Every session A–D ends with a non-null closer, so this is the ordinary case, not an edge case. Take **session A of WE-2** at the instant the closer is about to be presented: all 26 non-closer `TrialCompleted` events have been folded, the closer's own `TrialCompleted` has **not**, and `S_A` is still open (S3 and S10 have not run, so `lastSeenAtMs` and `dueAtMs` still hold their `S0` values).
+
+Closer = `it_0311` (`sessionCount 12 mod 5 = 2`). Call at `nowMonoMs = 550000`, `nowAnchorMs = SA + 550000 = 1800349550000`.
+
+**The state the call reads:**
+
+```
+it_0311 (state.items): tier 2, cueLevel 2, acrossRung 4, stableSessions 0,
+                       lastSeenAtMs 1800000000000, addedAtMs 1799136000000,
+                       repetitionNumber 36            // 30 + its six counted trials
+its roster entry:      trialsThisSession 6, withinRung 6, overdueReturn false,
+                       lastTerminalMonoMs 516000,
+                       nextEligibleMonoMs 516000 + WITHIN_LADDER_MS[5] (320000) = 836000
+session:               driftAtStart 0, gentleActive false
+```
+
+```
+trialTelemetry(state, {kind:'CLOSER', itemId:'it_0311'}, 1800349550000, 550000) =
+{ itemId:'it_0311', itemTier:2, repetitionNumber:36,
+  daysSinceLastReview:        Math.floor(clampGap(1800349550000 - 1800000000000)/86400000) = 4,
+  daysSinceFirstIntroduction: Math.floor(clampGap(1800349550000 - 1799136000000)/86400000) = 14,
+  scheduledIntervalMs:        604800000,        // effectiveAcrossRung(tier2, rung4, drift0) = 4
+  acrossIntervalDeviationMs:  349550000 - 604800000 = -255250000,
+  withinSessionRung:          6,
+  withinIntervalDeviationMs:  550000 - 836000 = -286000,
+  attainedRung:               4,
+  driftAdjustmentApplied: 0, difficultyFloorTriggered: false, overdueReturnApplied: false,
+  openingCueLevel: 3, floorCueLevel: 2, wasVanishAttempt: false,
+  presentationMode: 'familiarity_exposure', nDistractors: 0, isCloser: true,
+  stability: null, difficulty: null, retrievability: null, predictedRecallProbability: null }
+```
+
+**Five things this pins that nothing else did:**
+
+1. **It is NOT the all-null shape.** Ten fields carry item-derived values. The reading in which a non-null closer returns `CLOSER(null)`'s shape "because a closer drives no ladder state" is withdrawn (§17.3 note 1).
+2. **`openingCueLevel: 3` but `floorCueLevel: 2`.** The 3 is §10.2's unconditional closer cue; the 2 is `it_0311.cueLevel`, its own floor. They differ, and §19.0.1's closer payload records the same pair (`trialClass: 'SUPPORTED'`, since `3 > 2`).
+3. **`repetitionNumber: 36`, pre-increment.** Folding the closer then makes it 37, which is the number WE-2's final table asserts. The telemetry row and the fold do not double-count.
+4. **`acrossIntervalDeviationMs` and `withinIntervalDeviationMs` are both negative**, and neither is clamped. The item is being shown 255 250 000 ms before its across-ladder gap is up and 286 000 ms before its within-ladder slot — because it is the closer, not because anything is wrong.
+5. **`withinIntervalDeviationMs` is measured against the STALE `nextEligibleMonoMs`.** The closer never writes that field (§10.2), so 836000 is the value trial 6 left behind. That is the intended reading, not an oversight.
+
+The same call with `nowAnchorMs`/`nowMonoMs` and a `state` whose `activeSession` is `null` returns the all-null shape with `openingCueLevel: 3, floorCueLevel: 3, isCloser: true, driftAdjustmentApplied: 0, difficultyFloorTriggered: false` — branch 1, where there is no item and no session to read.
+
+**The other three closers of the chain**, for `telemetry.json`: session B's is `it_0402` (floor 1, tier 2, `acrossRung 6`), session C's is `it_0555` (floor 2, tier 3, `acrossRung 3`), session D's is `it_0042` (floor 2, tier 1, `acrossRung 3`). Each is branch 3; each reports `openingCueLevel: 3` with its own `floorCueLevel`.
+
+---
+
+### WE-26 — a log that violates the §6.1 boundary obligation, folded anyway
+
+**NOT chained.** All three cases start from `S0` (§19.0), `seqHighWater = {d1: 100}`. `fold` does not sort, does not check and does not throw (§6.2), so each case asserts **the state `fold` actually produces**. This is the whole content of `ordering/out-of-order-batches.json`; there is no boundary function to call, because §21.1 exports none.
+
+#### Case 1 — a batch-2 event skewed *behind* batch 1: the session vanishes
+
+```
+raw, in the device's own seq order:
+  seq 101  SessionStarted  {sessionId:'S_A', bootId:'B1', anchorMs: 1800349000000, startedMonoMs: 0}
+  seq 102  TrialCompleted  {sessionId:'S_A', bootId:'B1', anchorMs: 1800348900000,   <- 100 s BEHIND
+                            itemId:'it_0042', openingCueLevel:1, floorCueLevel:1, trialClass:'FLOOR',
+                            isCloser:false, attempts:[{correct:true, cueLevel:1, latencyMs:4000,
+                            attemptIndex:0, interrupted:false, appBackgroundedMs:0}],
+                            terminalMonoMs: 4000, terminalAnchorMs: 1800348900000}
+
+canonicalOrder = [anchorMs asc, deviceId asc, seq asc]  ->  [seq 102, seq 101]
+```
+
+**Expected:**
+
+```
+1. seq 102 : R0 passes (102 > 100). R1 sets seqHighWater.d1 = 102.
+             R4 fires (activeSession === null) -> no other change. A NEW top-level object (§6.2).
+2. seq 101 : R0 FIRES (101 <= 102) -> returned BY REFERENCE, entirely unprocessed.
+
+final state deep-equals S0 EXCEPT seqHighWater = { d1: 102 }
+activeSession === null      <- the session was never opened. No error, no signal, no counter.
+```
+
+**This is the corruption the boundary obligation exists to prevent, and it is silent.** One inverted pair swallows an entire session: R0 cannot distinguish "already seen" from "arrived early". Assert it; do not assert an exception.
+
+#### Case 2 — two batches, session B skewed behind session A's close: R2 rewrites the reason
+
+```
+raw, in seq order:
+  seq 101  SessionStarted  {sessionId:'S_A', bootId:'B1', anchorMs: 1800349000000, startedMonoMs: 0}
+  seq 102  TrialCompleted  {sessionId:'S_A', bootId:'B1', anchorMs: 1800349004000, it_0042 CLEAN,
+                            openingCueLevel:1, floorCueLevel:1, trialClass:'FLOOR', isCloser:false,
+                            terminalMonoMs: 4000, terminalAnchorMs: 1800349004000}
+  seq 103  SessionEnded    {sessionId:'S_A', bootId:'B1', anchorMs: 1800349600000,
+                            reason:'budget_time', closerPresented:false, endedMonoMs: 600000}
+  seq 104  SessionStarted  {sessionId:'S_B', bootId:'B1', anchorMs: 1800349300000,  <- BATCH 2, 5 min behind
+                            startedMonoMs: 0}
+
+canonicalOrder  ->  [101 (…000000), 102 (…004000), 104 (…300000), 103 (…600000)]
+```
+
+**Expected, derived step by step:**
+
+```
+1. seq 101 : S_A opens. roster = planRoster(S0, 1800349000000)
+             = ['it_0101','it_0042','it_0203','it_0555','it_0311','it_0402']   (WE-2)
+2. seq 102 : it_0042 CLEAN at FLOOR. entry.trials=[{CLEAN,FLOOR}], trialsThisSession 1,
+             withinRung 0->1, repetitionNumber 30->31, lastTerminalAnchorMs 1800349004000
+3. seq 104 : R2 FIRES (sessionId differs) -> closeSession(S_A, reason:'app_crash',
+             closerPresented:false, anchorMs = max(1800349000000, 1800349300000) = 1800349300000)
+       S3  it_0042: CLEAN_SESSION -> acrossRung min(3+1, CEILING_RUNG[1]=4) = 4;
+                    stableSessions 1->2; lastSeenAtMs 1800349004000; ssp 0
+                    (the other five are NO_EVIDENCE -> hold, unchanged)
+       S4  it_0101, it_0203, it_0311, it_0402, it_0555: ssp 0 -> 1
+       S5  presented 1, missed 0, missRatePpt 0, supportIdxMilli floor(1000x1/1) = 1000
+       S6  push {sessionId:'S_A', startedAnchorMs:1800349000000, localDayIndex:20837,
+                 presentedItems:1, missRatePpt:0, supportIdxMilli:1000,
+                 qualifying:false, endedOnSuccess:false, endReason:'app_crash'}   <- NOT 'budget_time'
+       S7  g = max(0-1,0) = 0 ; not distress ; missRatePpt 0 not > 50  ->  0
+       S8  window opens 1799139700000. H_01 (1799136000000) is OUT; H_02..H_10 are in;
+           S_A is qualifying:false so it is excluded  ->  |W| = 9 >= 6.
+           bad = 0. up: 0 > 9 no. down: 0 <= 9 and tail H_08,H_09,H_10 all <= 50  ->  driftLevel 0.
+       S9  sessionCount 13 ; lastSessionEndedAtMs 1800349300000
+       S10 it_0042 dueAtMs = 1800349004000 + 604800000 = 1800953804000 ;
+           every other item's dueAtMs is rewritten to the value it already held
+       S11 activeSession = null
+             then S_B opens at 1800349300000: localDayIndex 20837, gentleActive false,
+             driftAtStart 0, roster = ['it_0101','it_0203','it_0555','it_0042','it_0311','it_0402'],
+             overdueReturn true for it_0101 only
+4. seq 103 : R0 FIRES (103 <= 104) -> S_A's real SessionEnded is dropped BY REFERENCE
+
+final: seqHighWater = { d1: 104 } ; activeSession = S_B, OPEN
+```
+
+#### Case 3 — the same log with the running maximum applied
+
+The boundary of §6.1 rewrites each event's `anchorMs` to the running maximum over that device's stream **in `seq` order**, so `seq 104` becomes `max(1800349600000, 1800349300000) = 1800349600000`. The fixture supplies that repaired array as plain input data; no exported function performs the rewrite.
+
+```
+canonicalOrder  ->  [101, 102, 103, 104]   (103 and 104 tie on anchorMs; seq breaks it)
+```
+
+`S_A` now closes on its own `SessionEnded` at `anchorMs 1800349600000` with `reason:'budget_time'`; `S_B` then opens at `1800349600000`. **The diff against case 2 is exactly four scalars, and nothing else:**
+
+| field | case 2 (corrupt) | case 3 (repaired) |
+|---|---|---|
+| `history[10].endReason` | `'app_crash'` | `'budget_time'` |
+| `participant.lastSessionEndedAtMs` | 1800349300000 | 1800349600000 |
+| `activeSession.startedAnchorMs` | 1800349300000 | 1800349600000 |
+| `activeSession.startedMonoMs` | 0 | 0 (unchanged) |
+
+Every item field, `seqHighWater.d1 = 104`, `sessionCount = 13`, `driftLevel = 0`, `history.length = 11`, `activeSession.localDayIndex = 20837`, the S_B roster order and every `overdueReturn` flag are **identical** in both. That is the honest measure of the damage: R2 keeps the evidence, and the loss is confined to the close reason and 300 000 ms of anchor. Case 1's loss — a whole session — is the one that matters, and it is why §6.1 states the obligation.
+
+---
+
+### WE-27 — a disagreeing `floorCueLevel` does NOT rewrite the floor on a non-MISS trial
+
+**NOT chained.** From `S0`, open `S_A` at `SA = 1800349000000`; `it_0042` is on the roster with `item.cueLevel = 1`, `stableSessions = 1`, `acrossRung = 3`. Fold a trial whose payload declares a floor of 3 — reachable only from a generated log (§5.1 note 4), and now fully defined.
+
+**(a) The `CLEAN` case — arm 5, `writesCueLevel: false`:**
+
+```
+TrialCompleted { sessionId:'S_A', itemId:'it_0042', openingCueLevel: 3, floorCueLevel: 3,
+                 trialClass:'FLOOR', isCloser:false,
+                 attempts:[{correct:true, cueLevel:1, latencyMs:4000, attemptIndex:0,
+                            interrupted:false, appBackgroundedMs:0}],
+                 terminalMonoMs: 20000, terminalAnchorMs: 1800349020000 }
+
+g0 = gradeOf(attempts[0]) = CLEAN                 // attempts[0].cueLevel is 1, not 3
+cueTransition({floor:3, openingCue:3, trialClass:'FLOOR', grade0:'CLEAN', cueRaisedThisSession:false})
+  = { cueLevel: 3, writesCueLevel: FALSE, stableSessionsReset: false,
+      vanishResolved: false, cueRaisedThisSession: false }        // arm 5
+
+EXPECTED, complete:
+  item.cueLevel        = 1        <- UNCHANGED. `writesCueLevel` is false, so reduce does not assign.
+  item.stableSessions  = 1        <- UNCHANGED. arm 5 resets nothing.
+  item.acrossRung      = 3        <- session still open; S3 has not run
+  item.repetitionNumber = 31
+  entry.withinRung     = 0 -> 1 ; entry.nextEligibleMonoMs = 20000 + 10000 = 30000
+  entry.withinDone     = TRUE                     <- reads openingCueLevel (3); §8.2 wins
+  entry.trials         = [ {CLEAN, FLOOR} ]
+  entry.cueRaisedThisSession = false
+```
+
+**The rejected reading, stated so it cannot be re-derived by accident:** if `reduce` assigned `item.cueLevel = cueTransition(...).cueLevel` unconditionally, this single `CLEAN` trial would move the floor **1 → 3**, permanently demoting Margaret's photograph to exposure-only on the strength of a payload field the presenter got wrong. `writesCueLevel` is the whole of the defence.
+
+Close the session with `SessionEnded{reason:'budget_time', closerPresented:false}` and `it_0042` gets `outcome = CLEAN_SESSION` → `acrossRung = min(3+1, 4) = 4`, `stableSessions = min(1+1,255) = 2`, `cueLevel` still **1**.
+
+**(b) The `MISS` counterpart — arm 3, `writesCueLevel: true`, and a two-rung jump that is CORRECT:** the identical payload with `attempts[0].correct = false` grades `MISS`, so arm 3 fires:
+
+```
+cueTransition({floor:3, …, grade0:'MISS', cueRaisedThisSession:false})
+  = { cueLevel: min(3+1,3) = 3, writesCueLevel: TRUE, stableSessionsReset: true,
+      vanishResolved: false, cueRaisedThisSession: true }
+
+item.cueLevel 1 -> 3   (a rise of TWO)   ;  item.stableSessions 1 -> 0
+entry.withinRung UNCHANGED at 0          ;  entry.withinDone TRUE
+```
+
+This is why **I-13's unconditional form is false** and has been restated: the rise is keyed on `event.floorCueLevel`, which the fold never reconciles against `item.cueLevel` (§9.4 authority table). Arm 3 fired exactly once, which is what I-13(a) asserts. Over the self-consistent payloads `nextTrial` produces — where `floorCueLevel === item.cueLevel` — the rise is `min(1+1,3) = 2`, one rung, and I-13(c) holds.
+
+---
+
+### WE-28 — I-9 against `src/contract/schema.ts`
+
+**NOT chained; no fold involved.** The four exports are stated literally in §21.2. The assertions, in full, so that the test-writer and the implementer cannot differ on envelope-versus-payload:
+
+```
+// clause 1 — the Attempt surface (P4, P27)
+ATTEMPT_KEYS deep-equals
+  ['correct','cueLevel','latencyMs','attemptIndex','interrupted','appBackgroundedMs']
+ATTEMPT_KEYS.every(k => !/confidence|rating|self|asr/i.test(k))            // true
+
+// clause 2 — DistressReported.source (EU AI Act Art. 5(1)(f))
+EVENT_VARIANTS['DistressReported.source'] deep-equals
+  ['patient_control','caregiver_report']                                   // length exactly 2
+it contains neither 'abandonment' nor 'repeated_skip'
+
+// clause 3 — no algorithmic removal (I-6, requirement 15)
+EVENT_VARIANTS['ItemRetired.by']   deep-equals ['caregiver','clinician']
+EVENT_VARIANTS['ItemReEnabled.by'] deep-equals ['caregiver','clinician']
+neither contains 'algorithm'
+
+// clause 4 — the payload/envelope split
+Object.keys(EVENT_SCHEMA).sort() deep-equals
+  ['AcuteSignalDelivered','DistressReported','GenericFillerShown','ItemAdded',
+   'ItemContentReadyChanged','ItemReEnabled','ItemRecognitionBlockSet','ItemRetired',
+   'ItemTierSet','ProbeBlockCompleted','ProbeDisabledSet','SessionEnded',
+   'SessionStarted','TrialCompleted']                                      // 14 names
+EVENT_SCHEMA.SessionStarted       deep-equals ['sessionId','startedMonoMs']
+EVENT_SCHEMA.AcuteSignalDelivered deep-equals []
+for every type T: EVENT_SCHEMA[T] contains NONE of ENVELOPE_KEYS, and does not contain 'type'
+ENVELOPE_KEYS deep-equals ['eventId','deviceId','bootId','seq','anchorMs']
+```
+
+`EVENT_SCHEMA.SessionStarted` is **two** entries, not eight. A test that expects the envelope inlined fails against a §21.2-conformant module, and vice versa; that is precisely the divergence `ENVELOPE_KEYS` exists to remove.
+
+These four names are exported from `src/contract/schema.ts` and **must not appear on the §21.1 frozen list**, which is asserted over `src/domain/scheduler/index.ts` (I-8).
+
+---
+
+### WE-29 — `ItemReEnabled` legitimately breaks I-4's interval bound until the next close
+
+**NOT chained.** Entering state: `S0` with two overrides on `it_0402` — `lastSeenAtMs = 1795000000000` (about 62.6 days before `E0`) and `dueAtMs = 1796209600000`. That entering state satisfies I-4(b): `1796209600000 − 1795000000000 = 1209600000 = ACROSS_LADDER_MS[5]`, exactly what S10 writes for a tier-2 item at `acrossRung 5`.
+
+Fold `ItemReEnabled{itemId:'it_0402', by:'caregiver', anchorMs: 1800400000000}`. Per §6.5:
+
+```
+status 'active' ; cueLevel 3 ; acrossRung 0 ; stableSessions 0 ; sessionsSincePresented 0
+dueAtMs = 1800400000000 + ACROSS_LADDER_MS[0] (5400000) = 1800405400000
+lastSeenAtMs UNTOUCHED at 1795000000000        <- §6.5 names it explicitly
+```
+
+**Now the arithmetic I-4 was asserting:**
+
+```
+dueAtMs − lastSeenAtMs = 1800405400000 − 1795000000000 = 5405400000 ms  (62.56 days)
+                       >  2592000000 (30 d)     -> the 30-day clause is BROKEN
+                       >   604800000 (7 d)      -> and the tier-1 clause would be broken too
+```
+
+**This is conformant behaviour, not a bug.** I-4(a) still holds (`acrossRung 0 <= CEILING_RUNG[2] = 6`). I-4(b) is a **postcondition of the §12.2 close pipeline**, not a state invariant, and no close has run since the re-enable. A property test that asserts the bound over *arbitrary* states fails against a correct implementation; scope it to states produced by a `closeSession`.
+
+**It repairs itself at the very next close, either way:**
+
+- **`it_0402` not presented:** S10 writes `dueAtMs = 1795000000000 + ACROSS_LADDER_MS[effectiveAcrossRung({tier:2, acrossRung:0}, 0)] = 1795000000000 + 5400000 = 1795005400000`. Difference `5400000` — inside the bound. The date is in the past, so the item sorts to the front of the next roster, which is exactly the intent of "minimum gap, re-earning its way up".
+- **`it_0402` presented:** S3 sets `lastSeenAtMs` to its terminal anchor and S10 writes that `+ 5400000`. Difference `5400000`.
+
+**The other reading is rejected, with its cost stated.** Making `ItemReEnabled` clear `lastSeenAtMs` (or clamp `dueAtMs`) to keep I-4 a state invariant is a **materially different scheduler**: a null `lastSeenAtMs` moves the item out of `returning` and into `fresh` in `planRoster` (§11), so it stops sorting by `PRIORITY_KEY` and instead competes for one of the `NEW_ITEMS_PER_SESSION = 1` reserved fresh slots — an item just brought back by a caregiver could be held out of the roster by a newly-added one — and `overdueReturn` becomes permanently `false` for it (§9.2 requires `lastSeenAtMs !== null`), removing the gentleness transform from precisely the item most likely to need it. `ItemReEnabled` does **not** touch `lastSeenAtMs`. §6.5 is the authority and I-4 was the thing that was wrong.
+
+**And the null case (I-4(c)):** fold `ItemAdded{itemId:'it_0600', tier:2, recognitionBlocked:false, contentReady:true, anchorMs:1800400000000}`. It has `lastSeenAtMs: null` and `dueAtMs: 1800400000000`. In JavaScript `1800400000000 − null === 1800400000000`, which exceeds every bound in the invariant and means nothing. **Guard the assertion on `item.lastSeenAtMs !== null`**; do not let the coercion decide.
+
+---
+
 ## 20. Edge-case register — every case an attacker raised, with its defined behaviour
 
 | # | Case | Defined behaviour | Where |
@@ -2691,7 +3090,7 @@ It returns; it does not throw.
 | E24 | Apathy: one session a fortnight | `LONG_ABSENCE_MS` forces a gentle first session back; `overdueReturn` adds a rung; the acute **absence** limb is the one detector that works at that density. Drift will not fire — declared, not hidden. | §12.1, §17.1, §25 |
 | E25 | First-ever session of a new participant | 2 fresh items, roster of 2, `FILLER` between repetitions. Ramp table in §11.3. | §11.3 |
 | E26 | Caregiver bulk-adds 40 items at onboarding | 1 new item per session thereafter; `ItemAdded` sets `dueAtMs = addedAtMs` explicitly, so there is no coercion ambiguity and no 40-item first session. | §6.5, §11 |
-| E27 | `TrialCompleted` naming an unknown `itemId` (probe, or deleted) | State unchanged (R5). Probe items are not in `state.items` at all. | §6.4, §16 |
+| E27 | `TrialCompleted` naming an unknown `itemId` (probe, or deleted) | State unchanged by **R6** — an unknown id has no roster entry. **Not R5**, which covers only the five `Item*` mutation events (§6.4 note 1). Probe items are not in `state.items` at all. | §6.4, §16 |
 | E28 | Two sessions on the same local day | Second session gets no probe block (`lastProbeLocalDay`); everything else is ordinary. | §16 |
 | E29 | DST boundary / participant travels | `tzOffsetMinutes` frozen at enrolment to **standard** time. `localDayIndex` is a study clock, not a wall calendar. Declared. | §1.4 |
 | E30 | `SetTier` mid-deployment | `acrossRung = min(acrossRung, CEILING_RUNG[newTier])`, then `dueAtMs` recomputed. | §6.5 |
@@ -2717,6 +3116,11 @@ It returns; it does not throw.
 | E50 | `latencyMs > MAX_LATENCY_MS`, `attempts.length > 4`, `attemptIndex` gaps, `seq` gaps | All accepted and folded as the rules read them. Only `attempts[0]` drives state; `gradeOf` compares against `slowLatencyMs` alone. | §2.3, §5.1 |
 | E51 | A `fold` input violating §6.1's per-device monotonicity | Tolerated, not detected: no check, no sort, no throw. R2 degrades the worst case to `app_crash`. | §6.2 |
 | E52 | `DistressReported.severity` of `mild` vs `severe` | **Behaviourally identical.** Carried for the record; consumed by nothing. | §5.1 note 6 |
+| E53 | `CLOSER` naming a **real** item passed to `trialTelemetry` | §17.3 **branch 3**: the item-derived shape. `openingCueLevel: 3` (§10.2), `floorCueLevel: item.cueLevel`, `repetitionNumber` **pre-increment**, `withinSessionRung` / `withinIntervalDeviationMs` / `overdueReturnApplied` from the roster entry, `withinIntervalDeviationMs` measured against the **stale** `nextEligibleMonoMs`. Not the all-null shape. | §17.3, WE-25 |
+| E54 | A payload whose `floorCueLevel` disagrees with `item.cueLevel` on a non-MISS trial | `cueTransition` arm 5 returns `writesCueLevel: false`, so `item.cueLevel` is **not written** and the item's own floor survives. On a MISS, arm 3 writes `min(floorCueLevel + 1, 3)` — which can be a two-rung rise, and is correct. | §9.4, WE-27, I-13 |
+| E55 | A log violating §6.1 that makes `seq` arrive out of order | R0 **drops** the late-sorting event silently; an entire session can vanish with no error and no counter. Tolerated, asserted, not detected. | §6.1, §6.2, WE-26 case 1 |
+| E56 | `ItemReEnabled` on an item last seen months ago | `dueAtMs = anchorMs + 90 min` while `lastSeenAtMs` is **untouched**, so `dueAtMs − lastSeenAtMs` legitimately exceeds the 30-day bound until the next session close re-runs S10. I-4's interval clause is a **close postcondition**, not a state invariant. | §6.5, I-4, WE-29 |
+| E57 | `median([])` | Returns **0**. Total, never `NaN`. Unreachable from `acuteChange` (its limb-1 guards require `recent.length >= 2` and `base.length >= 4`), but `median` is exported and `helpers.json` exercises it. | §17.1, §4.1 |
 
 ---
 
@@ -2728,26 +3132,26 @@ Generate random canonical logs (arbitrary interleavings of every event type, arb
 
 - **Config is `defaultConfig`** with at most the five per-participant fields of §2.1 varied inside their stated domains. Malformed configs are out of scope (§2.3).
 - **Events are well-typed but not well-behaved.** Generate unknown `itemId`s, empty `attempts`, foreign `sessionId`s and `bootId`s, negative gaps, `seq` gaps, out-of-range `latencyMs`, and `attempts.length` up to 8 — all of which `reduce` must absorb (I-17).
-- **`seq` is strictly increasing per `deviceId`** and `anchorMs` is non-decreasing per device, because §6.1 makes that the ingest boundary's job and the module is specified against a log that already satisfies it. A generator that violates it is testing the boundary, not this module; `ordering/out-of-order-batches.json` covers that case explicitly and separately.
+- **`seq` is strictly increasing per `deviceId`** and `anchorMs` is non-decreasing per device, because §6.1 makes that the ingest boundary's job and the module is specified against a log that already satisfies it. A generator that violates it is testing the boundary, not this module; `ordering/out-of-order-batches.json` covers that case explicitly and separately, keyed to **`fold`** and asserting the corrupted states rather than a boundary function this module does not export (§6.1, WE-26).
 
 | # | Invariant |
 |---|---|
 | **I-1** | Every numeric field of `SchedulerState` satisfies `Number.isInteger` after every fold step. No `NaN`, no `Infinity`, no non-integer. |
 | **I-2** | `fold(config, log)` deep-equals `fold(config, logWithEveryEventDuplicatedInPlace)`. And `reduce(reduce(s,e),e) === reduce(s,e)` **by reference identity**. |
 | **I-3** | `fold(config, log) === log.reduce(reduce, initialState(config))` — replay and incremental application are identical by construction; assert it anyway. |
-| **I-4** | For every item at every point: `0 <= acrossRung <= CEILING_RUNG[tier]`, and therefore `dueAtMs − lastSeenAtMs <= 2592000000` (30 d) for every item and `<= 604800000` (7 d) for every tier-1 item. |
+| **I-4** | **Split into a state invariant and a close postcondition (was over-stated, chosen).** **(a) State invariant, holds in every state:** `0 <= item.acrossRung <= CEILING_RUNG[item.tier]` for every item. **(b) Postcondition of the §12.2 close pipeline ONLY:** in any state returned by a `reduce` call that ran `closeSession` (a `SessionEnded` that passed S0, or an R2 crash close), every item satisfies `dueAtMs === (lastSeenAtMs === null ? addedAtMs : lastSeenAtMs + ACROSS_LADDER_MS[effectiveAcrossRung(item, participant.driftLevel)])` — S10's own formula — and therefore, for every item with `lastSeenAtMs !== null`, `dueAtMs − lastSeenAtMs <= 2592000000` (30 d), and `<= 604800000` (7 d) when `tier === 1`. **(c)** The subtraction is **never evaluated when `lastSeenAtMs === null`**; the test must guard on it, because JavaScript coerces `null` to `0` and would report `dueAtMs` itself. **(b) is NOT a state invariant**, and asserting it as one is a defect in the test, not in the implementation — see WE-29. |
 | **I-5** | `0 <= cueLevel <= 3`; `0 <= stableSessions <= 255`; `0 <= sessionsSincePresented <= 255`; `roster.length <= 8`; `trialsThisSession <= 7`; `history.length <= 90`; `gentleSessionsRemaining <= 3`; `driftLevel <= 2`. |
 | **I-6** | For every event type **except `ItemRetired`**, folding it over any state never produces an item with `status === 'retired'`. And no sequence of `TrialCompleted` events of any length, at any grades, changes any item's `status`. |
 | **I-7** | If `item.recognitionBlocked` then in every `TRIAL` directive for it `openingCueLevel === 3`, it never appears as a `foilItemId`, and `canVanish` is false. |
 | **I-8** | **The exported surface is exactly the frozen list of §21.1 — assert `Object.keys(module).sort()` deep-equals it.** The list contains no getter for `driftLevel` and no function returning a count of due, overdue or pending items; freezing the list *is* the assertion, so adding one later fails this test. |
-| **I-9** | `Attempt` has no key matching `/confidence\|rating\|self\|asr/i`. `DistressReported.source` has exactly two variants, both human. `ItemRetired.by` and `ItemReEnabled.by` have no `'algorithm'` variant. **Assert against `src/contract/schema.ts`**, which exports a plain-data `EVENT_SCHEMA: Record<SchedulerEvent['type'], readonly string[]>` listing each event type's payload keys, and `ATTEMPT_KEYS: readonly string[]`. These are the runtime artefacts the type-level claims are checked against; without them I-9 is unwritable. |
+| **I-9** | Asserted entirely against the **four** plain-data exports of `src/contract/schema.ts`, which §21.2 states literally. **(1)** `ATTEMPT_KEYS` deep-equals its literal and no member matches `/confidence\|rating\|self\|asr/i`. **(2)** `EVENT_VARIANTS['DistressReported.source']` deep-equals `['patient_control','caregiver_report']` — length exactly 2, both human, and it contains neither `'abandonment'` nor `'repeated_skip'` (EU AI Act Art. 5(1)(f)). **(3)** `EVENT_VARIANTS['ItemRetired.by']` and `EVENT_VARIANTS['ItemReEnabled.by']` each deep-equal `['caregiver','clinician']` and neither contains `'algorithm'`. **(4)** `Object.keys(EVENT_SCHEMA).sort()` deep-equals the sorted 14 type names, and every entry deep-equals its §21.2 literal — **payload keys only, excluding `type` and excluding the five `ENVELOPE_KEYS`**, in §5 declaration order. A `Record<type, string[]>` cannot express a value domain, which is why `EVENT_VARIANTS` exists; the previous revision's two-export version left clauses (2) and (3) with no artefact to assert against. |
 | **I-10** | **Structural, not spy-based.** The module never imports `Clock` or `Rng` and no exported function accepts one (§4). Assert: (a) the built module's source contains no occurrence of `Date`, `Math.random`, `performance`, `crypto`, `fetch`, `window` or `document` outside comments — this is the `no-restricted-globals` rule of the header, promoted to a test; (b) `fold(config, log)` called twice on the same inputs returns deeply-equal states. Spy injection is impossible by construction and must not be attempted. |
 | **I-11** | `nextTrial(state, t)` is a pure function: called twice with identical arguments it returns deeply-equal results and mutates nothing. Same for `planRoster`, `signals`, `trialTelemetry`, `sessionTelemetry` and every §4.1 helper. Assert by deep-equality of a structural clone of `state` taken before and after. |
 | **I-12** | **A GENERATOR constraint, not a module property.** Well-formed trial chains satisfy `attempts.length <= 4` and never end on a `MISS`; the *generator* emits only those, and requirement 7's "displayed success is 100%" is a claim about the runtime that produces the chains. `reduce` neither validates nor enforces it: a chain of length 9 ending on a `MISS` folds without complaint (only `attempts[0]` is read). Assert I-12 over the generator's output, never over `reduce`'s behaviour. |
-| **I-13** | Within one session, an item's `cueLevel` increases by at most 1 (`cueRaisedThisSession`), and `session.vanishUsed` transitions `false → true` at most once. |
+| **I-13** | **Restated at the level where it is true (was false against arbitrary payloads, chosen).** **(a)** Within one session, the cue-rise arm (§9.4 arm 3) fires **at most once per item**: across an item's trials in one session, `writesCueLevel === true` with `grade0 === 'MISS'` occurs at most once, guarded by `cueRaisedThisSession`. **(b)** `session.vanishUsed` transitions `false → true` at most once. **(c)** *Conditional form, over the self-consistent payloads `nextTrial` produces:* when every `TrialCompleted` for an item in a session carries `floorCueLevel === item.cueLevel` as of that trial, the item's `cueLevel` increases by at most 1 across the session. The **unconditional** form is false and must not be asserted: §5.1 note 4 makes `floorCueLevel` a trusted payload fact, so a generated trial with `floorCueLevel: 3` on an item at floor 0 that grades `MISS` legitimately writes `min(3+1,3) = 3` in one step. That is arm 3 behaving correctly, not a violation. |
 | **I-14** | `nextTrial` never returns `kind:'TRIAL'` with `itemId === session.lastPresentedItemId` while any other candidate exists. |
 | **I-15** | **Monotone safety, restated at the only level where it is non-vacuous.** The previous fold-level phrasing was vacuous: `trialClass` and `openingCueLevel` are trusted payload facts, so replaying a fixed log under a different `gentleSessionsRemaining` yields byte-identical item state, and there is no API to "force" the field anyway. Assert instead, over arbitrary `(state, entry)` pairs: (a) `resolvePresentation` with `gentleActive: true` returns an `openingCueLevel` **>=** the one with `gentleActive: false`, and likewise for `entry.overdueReturn` and for each increment of `driftAtStart`; (b) `canVanish` is **false** whenever any of the three is set; (c) `effectiveAcrossRung(item, d+1) <= effectiveAcrossRung(item, d)` for `d ∈ {0,1}`, hence the `dueAtMs` S10 writes is **no later**. Each is a total function of its arguments and each is decidable by exhaustive enumeration over the finite domain — no log generation required. |
-| **I-16** | For any log containing at least one `SessionEnded` with `closerPresented: true`, that session's `SessionSummary.endedOnSuccess === true`; and for `reason ∈ {distress_stop, abandoned, app_crash}`, `closerPresented` is `false` and `endedOnSuccess` is `false`. |
+| **I-16** | **Module property:** for every `SessionEnded` that passes S0, the pushed `SessionSummary.endedOnSuccess === event.closerPresented` — exactly, in both directions (§12.3). That is the whole of what `reduce` guarantees, and it is what the property test asserts. **A GENERATOR constraint, not a module property (was unlabelled):** that `reason ∈ {distress_stop, abandoned, app_crash}` implies `closerPresented === false`. `reduce` neither checks nor enforces it — `SessionEnded{reason:'app_crash', closerPresented:true}` folds without complaint and honestly records `endedOnSuccess: true`, because §12.3 reads the flag and nothing else. Constrain the generator to emit `closerPresented: false` for those three reasons, as the runtime does, and assert the pairing over the generator's output. Note that R2's own crash close always passes `closerPresented: false` (§6.3), so no fold-internal path can violate it. |
 | **I-17** | `reduce` never throws, for any `(state, event)` pair drawn from the declared types — including malformed-but-typed inputs (unknown ids, empty `attempts`, foreign `sessionId`, negative gaps). |
 | **I-18** | **State size is bounded, with a constant to assert against.** `JSON.stringify(state).length <= 4096 + 512 × |items| + 256 × min(90, sessionsClosed) + 64 × |devices|`. And: folding a log of 10 000 events over a fixed 40-item deck and a fixed device set yields a serialised length no greater than folding the first 1 000 — the size is a function of the deck and the 90-entry history ring, never of the event count. |
 | **I-19** | **Fold order within a session is immaterial.** For any session's event array, any permutation that preserves each item's own trial order, keeps `SessionStarted` first and `SessionEnded` last, and keeps `seq` ascending per device, folds to a deeply-equal final state. This is what makes §19's item-major event logs legitimate fixture inputs (§19.0.1). |
@@ -2755,14 +3159,75 @@ Generate random canonical logs (arbitrary interleavings of every event type, arb
 ### 21.1 The frozen export list (I-8)
 
 ```
-acuteChange, acrossTransition, canVanish, clampGap, closerItemId, cueTransition,
+acrossTransition, acuteChange, canVanish, clampGap, closerItemId, cueTransition,
 defaultConfig, effectiveAcrossRung, evaluateDrift, foilFor, fold, gapBinds, gradeOf,
 initialState, isVoid, localDayIndex, median, nextTrial, outcomeFor, overdueReturn,
 planRoster, probeDue, reduce, resolvePresentation, sessionTelemetry, signals,
 trialTelemetry
 ```
 
-27 names, sorted. Types and interfaces are erased at runtime and are not part of the assertion. Nothing else is exported; in particular there is no `getDriftLevel`, no `dueCount`, no `overdueItems`, and no `pendingItems`. `probeDue` returns a `boolean` about the probe block and is not an item query.
+27 names, **sorted by `strAsc`** — the previous revision printed `acuteChange` before `acrossTransition`, which is not `strAsc` order (`'acr' < 'acu'` because `'r' < 'u'`); I-8 compares against `Object.keys(module).sort()`, so the list above is the one to transcribe. Types and interfaces are erased at runtime and are not part of the assertion. Nothing else is exported; in particular there is no `getDriftLevel`, no `dueCount`, no `overdueItems`, and no `pendingItems`. `probeDue` returns a `boolean` about the probe block and is not an item query.
+
+**`src/contract/schema.ts` is a SEPARATE module and is NOT part of this list.** I-8 is asserted over `src/domain/scheduler/index.ts` only. Adding the four §21.2 exports to the scheduler module would fail I-8.
+
+### 21.2 `src/contract/schema.ts` — the complete literal (I-9)
+
+Four exports, all plain data, all frozen, no functions. They exist so that the type-level claims of §5.1 notes 1–3 and §4's `Attempt` declaration have a **runtime** artefact to be asserted against; without them I-9 is unwritable, and a `Record<type, string[]>` of key names alone cannot express a value domain.
+
+```ts
+// src/contract/schema.ts
+import type { SchedulerEvent } from './events';
+
+/** The five envelope keys of §5, shared by every event. NOT included in EVENT_SCHEMA entries. */
+export const ENVELOPE_KEYS: readonly string[] =
+  ['eventId', 'deviceId', 'bootId', 'seq', 'anchorMs'];
+
+/** The keys of `Attempt` (§4), in declaration order. */
+export const ATTEMPT_KEYS: readonly string[] =
+  ['correct', 'cueLevel', 'latencyMs', 'attemptIndex', 'interrupted', 'appBackgroundedMs'];
+
+/** PAYLOAD keys per event type, in §5 declaration order.
+ *  Excludes `type`. Excludes ENVELOPE_KEYS. Exactly 14 entries. */
+export const EVENT_SCHEMA: Record<SchedulerEvent['type'], readonly string[]> = {
+  ItemAdded:                ['itemId', 'tier', 'recognitionBlocked', 'contentReady'],
+  ItemContentReadyChanged:  ['itemId', 'contentReady'],
+  ItemTierSet:              ['itemId', 'tier', 'by'],
+  ItemRecognitionBlockSet:  ['itemId', 'recognitionBlocked', 'by'],
+  ItemRetired:              ['itemId', 'by', 'reason'],
+  ItemReEnabled:            ['itemId', 'by'],
+  ProbeDisabledSet:         ['disabled', 'by'],
+  SessionStarted:           ['sessionId', 'startedMonoMs'],
+  TrialCompleted:           ['sessionId', 'itemId', 'openingCueLevel', 'floorCueLevel',
+                             'trialClass', 'isCloser', 'attempts',
+                             'terminalMonoMs', 'terminalAnchorMs'],
+  GenericFillerShown:       ['sessionId'],
+  ProbeBlockCompleted:      ['sessionId', 'elapsedMs', 'truncated'],
+  DistressReported:         ['sessionId', 'itemId', 'severity', 'source'],
+  SessionEnded:             ['sessionId', 'reason', 'closerPresented', 'endedMonoMs'],
+  AcuteSignalDelivered:     [],
+};
+
+/** VALUE DOMAINS for every string-union payload field in §5, keyed '<EventType>.<field>'.
+ *  Exactly these 9 keys; no others. Members in §5 declaration order. */
+export const EVENT_VARIANTS: Readonly<Record<string, readonly string[]>> = {
+  'ItemTierSet.by':              ['caregiver', 'clinician'],
+  'ItemRecognitionBlockSet.by':  ['caregiver', 'clinician'],
+  'ItemRetired.by':              ['caregiver', 'clinician'],
+  'ItemReEnabled.by':            ['caregiver', 'clinician'],
+  'ProbeDisabledSet.by':         ['caregiver', 'clinician'],
+  'TrialCompleted.trialClass':   ['FLOOR', 'SUPPORTED', 'VANISH'],
+  'DistressReported.severity':   ['mild', 'moderate', 'severe'],
+  'DistressReported.source':     ['patient_control', 'caregiver_report'],
+  'SessionEnded.reason':         ['budget_time', 'budget_trials', 'roster_exhausted',
+                                  'user_ended', 'distress_stop', 'abandoned', 'app_crash'],
+};
+```
+
+Three decisions a blind agent must not have to infer:
+
+1. **Payload keys only.** `EVENT_SCHEMA.SessionStarted` is `['sessionId','startedMonoMs']` and **not** `['eventId','deviceId','bootId','seq','anchorMs','type','sessionId','startedMonoMs']`. The envelope lives in its own export precisely so that a deep-equality assertion cannot diverge on this choice.
+2. **`type` is not a key of any entry.** `AcuteSignalDelivered` therefore maps to the empty array, which is correct and asserted.
+3. **Arrays are order-sensitive and are given literally above.** Transcribe them; do not sort them. `EVENT_VARIANTS` has exactly nine keys — the `Attempt` fields are all primitives and contribute none, and `CueLevel`/`Tier`/`Rung` are numeric unions carried by the types and by §2.3's precondition, not by this table.
 
 ---
 
@@ -2787,14 +3252,14 @@ trialTelemetry
 
 The blind test-writer authors these from this document alone. They are **data**, not prose.
 
-**Every fixture below is keyed to a name on the §21.1 frozen export list.** The previous revision keyed five files to computations that had no exported name — about 1 250 of ~1 500 rows were unwritable as specified. That is fixed by §4.1, not by rewording the manifest.
+**Every fixture below is keyed to one or more names on the §21.1 frozen export list, and every one of the 27 names is exercised by at least one file.** An earlier revision keyed five files to computations that had no exported name; a later one still keyed `ordering/out-of-order-batches.json` to "the ingest boundary", which is not an export and does not exist — that row is now keyed to **`fold`** (§6.1, WE-26), and `helpers.json` and `signals.json` have been added to cover `clampGap`, `gapBinds`, `localDayIndex`, `initialState` and `signals`, which no file previously named. The mapping is now total in both directions and a blind test-writer can verify it by intersecting this table's "Exercises" column with §21.1.
 
 | File | Exercises | Shape | Rows / cases |
 |---|---|---|---|
 | `config.json` | `defaultConfig` | the serialised object → deep equality | **1** (pins 49 field names and values) |
 | `grades.json` | `gradeOf`, `isVoid` | `{correct, cueLevel, latencyMs, attemptIndex, interrupted, appBackgroundedMs, slowLatencyMs, minPlausibleLatencyMs} → {grade, isVoid}` | **128** — the exhaustive cross-product of §7.2 |
 | `decision-table.json` | the fold | the 72 rows of §18, verbatim, plus the 8 rows of §18.1 | **80** |
-| `cue-transitions.json` | `cueTransition` | `{floor, openingCue, trialClass, grade0, cueRaisedThisSession} → {cueLevel, stableSessionsReset, vanishResolved, cueRaisedThisSession}` | 4 × 4 × 3 × 4 × 2 = **384**, every row carrying values (see below) |
+| `cue-transitions.json` | `cueTransition` | `{floor, openingCue, trialClass, grade0, cueRaisedThisSession} → {cueLevel, writesCueLevel, stableSessionsReset, vanishResolved, cueRaisedThisSession}` | 4 × 4 × 3 × 4 × 2 = **384**, every row carrying all five output values (§9.4's five-arm table) |
 | `outcome.json` | `outcomeFor` | `{trials: [{grade0, trialClass}]} → SessionOutcome` | ~40 cases exercising the six-step order, especially step 4 before step 5 |
 | `across-transitions.json` | `acrossTransition`, `effectiveAcrossRung` | `{tier, acrossRung, outcome, vanishResolved, driftLevel} → {acrossRung, stableSessions, dueOffsetMs}` with entering `stableSessions` fixed at **0** and `dueOffsetMs = acrossLadderMs[effectiveAcrossRung({tier, acrossRung: result.acrossRung}, driftLevel)]` | 3 × 7 × 6 × 2 × 3 = **756** |
 | `roster-order.json` | `planRoster` | `{items[], nowAnchorMs, sessionCount} → {itemIds[], forcedMissing[]}` | ~30: all-due, none-due, one-due, forced-tier-1 overflow, fresh-item reservation, first-session cap of 2, `contentReady` exclusion, the `it_10 < it_9` tie-break, the §11.1 length formula |
@@ -2802,10 +3267,12 @@ The blind test-writer authors these from this document alone. They are **data**,
 | `drift.json` | `evaluateDrift` | `{history[], anchorMs, driftLevel} → driftLevel'` | ~40: below/at `DRIFT_MIN_SESSIONS`, 2-vs-3 consecutive, recovery, the `bad*2 > n` boundary at `n = 6, 7`, non-qualifying entries excluded, duplicate `sessionId` |
 | `acute.json` | `acuteChange`, `median` | `{history[], nowAnchorMs, acuteLastFiredAtMs} → limb \| null` | ~25: all three limbs, the WE-14 masking case, the even/odd median, the rate limit, `acuteSignalEnabled: false` |
 | `presentation.json` | `resolvePresentation`, `canVanish`, `foilFor`, `overdueReturn` | `{state, entry} → {openingCueLevel, floorCueLevel, trialClass, foilItemId}` | ~35: `recognitionBlocked` first, the three transforms and their clamping, the vanish branch, the empty-foil-pool rewrite to cue 3 |
-| `telemetry.json` | `trialTelemetry`, `sessionTelemetry` | `{state, directive, nowAnchorMs, nowMonoMs} → TrialSchedulingTelemetry`, and `{state, reason, closerPresented} → SessionSchedulingTelemetry \| null` | ~20, including `CLOSER(null)`, `activeSession === null`, and every `presentationMode` / `nDistractors` pair |
-| `ordering/out-of-order-batches.json` | the ingest boundary | two-batch session with inverted `anchorMs` → expected state | 3 |
+| `telemetry.json` | `trialTelemetry`, `sessionTelemetry` | `{state, directive, nowAnchorMs, nowMonoMs} → TrialSchedulingTelemetry`, and `{state, reason, closerPresented} → SessionSchedulingTelemetry \| null` | ~20, covering all four §17.3 branches: a real `TRIAL` (WE-24), a **`CLOSER` naming a real item** (WE-25, branch 3), `CLOSER(null)` (branch 2), `activeSession === null` (branch 1), a directive naming an id not in `state.items` (branch 4), and every `presentationMode` / `nDistractors` pair |
+| `helpers.json` | `clampGap`, `gapBinds`, `localDayIndex`, `median`, `initialState` | `{input…} → value` | ~30: both `clampGap` bounds and the negative branch, `gapBinds` at `0`/`clockMaxGapMs`/`clockMaxGapMs + 1`, `localDayIndex` at `tzOffsetMinutes ∈ {−720, 0, 840}` and across a pre-1970 anchor, `median` odd/even/singleton/**empty (→ 0)**, `initialState(defaultConfig)` against the §2.2 literal |
+| `signals.json` | `signals` | `{state, nowAnchorMs} → SchedulerSignal[]` | ~12: empty, each kind alone, all three together in the §17.2 order (tier1, set_aside, acute), and the rate-limited/`acuteSignalEnabled: false` suppression |
+| `ordering/out-of-order-batches.json` | **`fold`** | a non-monotone log → the state `fold` actually produces (tolerated corruption, §6.1) | **3** — WE-26 cases 1, 2, 3 |
 | `sessions/no-op-seq.json` | R1 vs R3–R12 | one no-op event per rule → expected state | **10** (WE-17) |
-| `sessions/*.json` | `fold` | full event log → full expected final `SchedulerState`, compared by deep equality | **WE-2 → WE-3 → WE-4 → WE-5, chained** (four files, each starting from the previous file's asserted final state), plus `we-2-permuted` (I-19), WE-6 (×3 outcomes), WE-7, WE-8, WE-9, WE-10, WE-11, WE-15, WE-16, WE-18, WE-19, WE-20, WE-21, WE-22, WE-23 |
+| `sessions/*.json` | `fold` | full event log → full expected final `SchedulerState`, compared by deep equality | **WE-2 → WE-3 → WE-4 → WE-5, chained** (four files, each starting from the previous file's asserted final state), plus `we-2-permuted` (I-19), WE-6 (×3 outcomes), WE-7, WE-8, WE-9, WE-10, WE-11, WE-15, WE-16, WE-18, WE-19, WE-20, WE-21, WE-22, WE-23, WE-27 (×2: the CLEAN and the MISS variant), WE-29 |
 
 **`unreachable` in `cue-transitions.json` — the exact predicate.** `unreachable` is an **informational label, never a missing value**: `cueTransition` is total, so every one of the 384 rows carries a full expected result and both agents must produce it. A row is labelled `unreachable: true` iff any of:
 
@@ -2821,7 +3288,7 @@ Anything else is `unreachable: false`. Note that (b) and (c) describe the *self-
 
 `sessions/*.json` is the highest-value artefact: feed the event array, compare the serialised final state field-for-field. It cannot pass for the wrong reason and it is writable by an agent who has never seen the implementation, from §19 alone. §19.0 now states a **complete literal `S0`** — every history entry, every `addedAtMs`, every `dueAtMs`, every `repetitionNumber`, the envelope rule and the `seq` origin — and §19.0.1 states the event-generation rule, so both sides of the deep equality are constructible.
 
-**Every number in §19 was re-derived from the rules in §§6–17 under the chaining declared in §19.0.2, and must be re-derived again, not trusted, when the fixtures are authored — a disagreement between §19 and §§6–17 is a defect in this document and must be raised, not silently resolved.** Three such disagreements were raised against the previous revision and are now fixed: the chained vanish eligibility entering session C, `it_0101`'s `stableSessions` entering session D, and `|W|` in the drift window at the close of sessions A and C.
+**Every number in §19 was re-derived from the rules in §§6–17 under the chaining declared in §19.0.2, and must be re-derived again, not trusted, when the fixtures are authored — a disagreement between §19 and §§6–17 is a defect in this document and must be raised, not silently resolved.** Three such disagreements were raised against an earlier revision and are fixed: the chained vanish eligibility entering session C, `it_0101`'s `stableSessions` entering session D, and `|W|` in the drift window at the close of sessions A and C. **A fourth was raised against the last revision and is fixed here: session D's filler count.** §19 asserted `fillersShown: 1`; §10's picker produces **5**, because `it_0555` (tier 3) sorts after `it_0402` (tier 2) and so covers the first gap for free, leaving five gaps to fill. The derivation is now printed in WE-5 as a call-by-call trace, the number is 5 in both `sessionTelemetry` and the log, and `seqHighWater.d1` for the four chained files is pinned at 129 / 158 / 188 / **208**. That is the pattern to follow: re-derive, and when §19 and §§6–17 disagree, §§6–17 win and the defect is raised.
 
 ---
 
